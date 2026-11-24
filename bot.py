@@ -1,4 +1,4 @@
-"""Crypto bot v4: honest strategy test. No real money, no wallet, stdlib only.
+"""Crypto bot v4.1: honest strategy test. No real money, no wallet, stdlib only.
 
 Usage:  python bot.py backtest   (or env MODE=backtest)
         python bot.py paper
@@ -10,6 +10,8 @@ How it stays honest:
    SOL did not exist before 2020, so it is fully unseen.
 3. Signals use only past data and trades happen at the NEXT day's open.
 4. Result is compared with a matched coin flip (random long/cash, same number of trades).
+
+v4.1: data now comes from Yahoo Finance (backup: Coinbase). No API key needed.
 """
 import itertools
 import json
@@ -25,27 +27,72 @@ CUT = 1577836800  # 2020-01-01 UTC
 DEV_BEGIN = 200  # warm-up bars before trading starts in the dev period
 TARGET_VOL = 0.03
 SIMS = 300
+EARLIEST = 1388534400  # 2014-01-01 UTC
 
 
 # ---------- data ----------
-def fetch_history(sym):
-    """Daily candles from CryptoCompare (free, no key). Returns [(ts,o,h,l,c)] oldest first."""
-    today = int(time.time() // 86400 * 86400)
-    out, to_ts = {}, today
-    for _ in range(12):
-        url = (f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={sym}"
-               f"&tsym=USD&limit=2000&toTs={to_ts}")
-        req = urllib.request.Request(url, headers={"User-Agent": "crypto-bot"})
-        data = json.load(urllib.request.urlopen(req, timeout=30))
-        rows = data["Data"]["Data"]
-        good = [r for r in rows if r["close"] > 0 and r["open"] > 0 and r["high"] > 0 and r["low"] > 0]
-        for r in good:
-            out[r["time"]] = (r["time"], r["open"], r["high"], r["low"], r["close"])
-        if not good or len(good) < 50:
+def _get_json(url, tries=3):
+    last = None
+    for k in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; crypto-bot)"})
+            return json.load(urllib.request.urlopen(req, timeout=30))
+        except Exception as e:  # noqa
+            last = e
+            time.sleep(2 * (k + 1))
+    raise last
+
+
+def _yahoo(sym):
+    now = int(time.time())
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}-USD"
+           f"?period1={EARLIEST}&period2={now}&interval=1d")
+    r = _get_json(url)["chart"]["result"][0]
+    q = r["indicators"]["quote"][0]
+    out = []
+    for t, o, h, l, c in zip(r["timestamp"], q["open"], q["high"], q["low"], q["close"]):
+        if None in (o, h, l, c) or min(o, h, l, c) <= 0:
+            continue
+        out.append((t // 86400 * 86400, o, h, l, c))
+    return out
+
+
+def _coinbase(sym):
+    def iso(x):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(x))
+    out, end = {}, int(time.time() // 86400 * 86400)
+    while end > EARLIEST:
+        start = end - 299 * 86400
+        url = (f"https://api.exchange.coinbase.com/products/{sym}-USD/candles"
+               f"?granularity=86400&start={iso(start)}&end={iso(end)}")
+        rows = _get_json(url)
+        if not rows:
             break
-        to_ts = rows[0]["time"] - 86400
-    candles = sorted(v for k, v in out.items() if k < today)  # drop today's open candle
-    return candles
+        for t, l, h, o, c, _v in rows:
+            if min(o, h, l, c) > 0:
+                out[t] = (t, o, h, l, c)
+        end = start - 86400
+        time.sleep(0.4)
+    return list(out.values())
+
+
+def fetch_history(sym):
+    """Daily candles [(ts,o,h,l,c)] oldest first. Yahoo first, Coinbase as backup."""
+    today = int(time.time() // 86400 * 86400)
+    candles, src = [], None
+    for name, fn in (("Yahoo", _yahoo), ("Coinbase", _coinbase)):
+        try:
+            candles = fn(sym)
+            if len(candles) >= 200:
+                src = name
+                break
+        except Exception as e:  # noqa
+            print(f"{sym}: {name} failed ({e})")
+    if not src:
+        raise RuntimeError(f"No data source worked for {sym}")
+    print(f"{sym}: data from {src}")
+    uniq = {c[0]: c for c in candles if c[0] < today}  # drop today's open candle
+    return [uniq[k] for k in sorted(uniq)]
 
 
 # ---------- signals (all causal: bar i uses data up to and including bar i) ----------
@@ -281,4 +328,5 @@ def run_paper():
 if __name__ == "__main__":
     mode = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MODE", "backtest")).lower()
     run_paper() if mode == "paper" else run_backtest()
+
 
