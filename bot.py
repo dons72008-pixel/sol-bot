@@ -1,4 +1,4 @@
-"""Crypto bot v4.2: honest strategy test. No real money, no wallet, stdlib only.
+"""Crypto bot v4.3: honest strategy test. No real money, no wallet, stdlib only.
 
 Usage:  python bot.py backtest   (or env MODE=backtest)
         python bot.py paper
@@ -10,6 +10,8 @@ How it stays honest:
    SOL did not exist before 2020, so it is fully unseen.
 3. Signals use only past data and trades happen at the NEXT day's open.
 4. Result is compared with a matched coin flip (random long/cash, same number of trades).
+
+v4.3: adds a "memory" version of the rule, shown side by side for comparison only.
 
 v4.2: adds a trade journal, loss report, floating P&L and a Faber 10-month comparison.
 The way the rule is chosen is unchanged.
@@ -197,6 +199,32 @@ def faber_signal(candles):
     return out
 
 
+# ---------- memory: learn from past mistakes ----------
+MIN_SEEN = 5  # a pattern must be seen this often before it can be blocked
+
+
+def memory_signal(candles, want):
+    """Skip a new buy if the same market pattern lost money on average before.
+
+    It learns from every earlier trade of the base rule (taken or skipped), and
+    only from trades already closed on the day of the decision (no peeking).
+    """
+    past = []
+    equity_curve(candles, want, 200, log=past)
+    closes = [c[4] for c in candles]
+    out, skip, blocked = [], False, []
+    for i, w in enumerate(want):
+        if w and (i == 0 or not want[i - 1]):
+            now = conditions(closes, i)
+            same = [t["pnl"] for t in past if "pnl" in t and t["out"] <= candles[i][0]
+                    and all(t[k] == now[k] for k in now)]
+            skip = len(same) >= MIN_SEEN and sum(same) / len(same) < 0
+            if skip:
+                blocked.append((i, now, len(same), sum(same) / len(same)))
+        out.append(w and not skip)
+    return out, blocked
+
+
 # ---------- simulator ----------
 def equity_curve(candles, want, begin, stop=None, volsize=False, log=None):
     """Signal at close of bar i-1 -> trade at open of bar i."""
@@ -346,10 +374,17 @@ def test_asset(sym, candles, cfg, begin):
         print(f"  bear {y}: strategy {yy[y]:+.0f}% vs buy&hold {bh[y]:+.0f}%, beats {beat:.0f}% of coin flips")
     f_eq, f_tr = equity_curve(candles, faber_signal(candles), begin)
     print("\nCOMPARE (same dates, fees included)   return   max drawdown   orders")
-    for name, curve, n in (("frozen rule", eq, tr), ("Faber 10-month", f_eq, f_tr),
+    m_want, blocked = memory_signal(candles, make_signal(candles, cfg[0]))
+    m_eq, m_tr = equity_curve(candles, m_want, begin, cfg[1], cfg[2])
+    for name, curve, n in (("frozen rule", eq, tr), ("rule + memory", m_eq, m_tr),
+                           ("Faber 10-month", f_eq, f_tr),
                            ("buy & hold", bh_curve(candles, begin), 0)):
         print(f"  {name:32}{(curve[-1] / START - 1) * 100:>+8.0f}%{max_dd(curve):>13.0f}%{n:>9}")
     journal_report(sym, log)
+    recent = [b for b in blocked if b[0] >= begin]
+    print(f"Memory blocked {len(recent)} buys in the test years. Last 5:")
+    for i, now, n, avg in recent[-5:]:
+        print(f"  {day(candles[i][0])} {now['trend']}, {now['chop']}, {now['vol']}: seen {n} times, avg {avg:+.1f}%")
     ok = pr >= 95
     print("VERDICT:", "PASS (>=95th percentile of coin flips)" if ok else "NOT proven better than a coin flip")
     return ok
@@ -394,6 +429,7 @@ def run_paper():
         # replay history to see whether the paper position is open
         equity_curve(c, want, 200, cfg[1], cfg[2], log)
         print(f"{s} last close {last:.2f}: signal {'HOLD' if want[-1] else 'CASH'}")
+        print(f"  with memory: {'HOLD' if memory_signal(c, want)[0][-1] else 'CASH'}")
         if log and "pnl" not in log[-1]:
             t = log[-1]
             print(f"  FLOATING: bought {day(t['in'])} at {t['buy']:.2f}, "
