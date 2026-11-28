@@ -1,4 +1,4 @@
-"""Crypto bot v4.1: honest strategy test. No real money, no wallet, stdlib only.
+"""Crypto bot v4.2: honest strategy test. No real money, no wallet, stdlib only.
 
 Usage:  python bot.py backtest   (or env MODE=backtest)
         python bot.py paper
@@ -10,6 +10,9 @@ How it stays honest:
    SOL did not exist before 2020, so it is fully unseen.
 3. Signals use only past data and trades happen at the NEXT day's open.
 4. Result is compared with a matched coin flip (random long/cash, same number of trades).
+
+v4.2: adds a trade journal, loss report, floating P&L and a Faber 10-month comparison.
+The way the rule is chosen is unchanged.
 
 v4.1: data now comes from Yahoo Finance (backup: Coinbase). No API key needed.
 """
@@ -142,8 +145,60 @@ def daily_vol(closes, i, n=20):
     return (sum((r - m) ** 2 for r in rets) / len(rets)) ** 0.5
 
 
+# ---------- trade journal ----------
+def conditions(closes, i):
+    """Market state known at the close of bar i (no future data)."""
+    trend = "no-data"
+    if i >= 199:
+        trend = "uptrend" if closes[i] > sum(closes[i - 199:i + 1]) / 200 else "downtrend"
+    chop = "no-data"
+    if i >= 20:
+        path = sum(abs(closes[j] - closes[j - 1]) for j in range(i - 19, i + 1))
+        chop = "sideways" if abs(closes[i] - closes[i - 20]) < 0.3 * path else "trending"
+    vol = "wild" if i >= 1 and daily_vol(closes, i) > 0.04 else "calm"
+    return {"trend": trend, "chop": chop, "vol": vol}
+
+
+def _close(log, ts, px, why):
+    t = log[-1]
+    t.update(out=ts, sell=px, why=why, pnl=(px * (1 - FEE) ** 2 / t["buy"] - 1) * 100)
+
+
+def day(ts):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def journal_report(sym, log, last=10):
+    done = [t for t in log if "pnl" in t]
+    if not done:
+        print(f"{sym} journal: no closed trades")
+        return
+    lost = [t for t in done if t["pnl"] <= 0]
+    print(f"\n{sym} journal: {len(done)} closed trades, {len(lost)} lost. Last {min(last, len(done))}:")
+    for t in done[-last:]:
+        print(f"  {day(t['in'])} -> {day(t['out'])} {t['pnl']:+6.1f}% exit={t['why']:9} {t['trend']}, {t['chop']}, {t['vol']}")
+    print("Where it lost (lost/total, average result):")
+    for key in ("trend", "chop", "vol", "why"):
+        for val in sorted({t[key] for t in done}):
+            g = [t for t in done if t[key] == val]
+            bad = sum(1 for t in g if t["pnl"] <= 0)
+            few = "  (too few to judge)" if len(g) < 10 else ""
+            print(f"  {val:10} {bad}/{len(g)} lost, avg {sum(t['pnl'] for t in g) / len(g):+.1f}%{few}")
+
+
+def faber_signal(candles):
+    """Month end: hold if close > average of the last 10 month-end closes."""
+    ends, out, state = [], [], False
+    for t, _o, _h, _l, c in candles:
+        if time.gmtime(t).tm_mon != time.gmtime(t + 86400).tm_mon:
+            ends.append(c)
+            state = len(ends) >= 10 and c > sum(ends[-10:]) / 10
+        out.append(state)
+    return out
+
+
 # ---------- simulator ----------
-def equity_curve(candles, want, begin, stop=None, volsize=False):
+def equity_curve(candles, want, begin, stop=None, volsize=False, log=None):
     """Signal at close of bar i-1 -> trade at open of bar i."""
     closes = [c[4] for c in candles]
     cash, coins, entry = START, 0.0, None
@@ -152,6 +207,8 @@ def equity_curve(candles, want, begin, stop=None, volsize=False):
         _, o, h, l, c = candles[i]
         w = want[i - 1]
         if coins and not w:
+            if log is not None:
+                _close(log, candles[i][0], o, "signal")
             cash = coins * o * (1 - FEE)
             coins, entry = 0.0, None
             trades += 1
@@ -162,9 +219,13 @@ def equity_curve(candles, want, begin, stop=None, volsize=False):
             cash -= spend
             entry = o
             trades += 1
+            if log is not None:
+                log.append({"in": candles[i][0], "buy": o, **conditions(closes, i - 1)})
         if coins and stop and l <= entry * (1 - stop):
             px = min(o, entry * (1 - stop))
             cash += coins * px * (1 - FEE)
+            if log is not None:
+                _close(log, candles[i][0], px, "stop-loss")
             coins, entry = 0.0, None
             trades += 1
             stopped = True
@@ -259,7 +320,8 @@ def pct_rank(sorted_vals, x):
 
 # ---------- reports ----------
 def test_asset(sym, candles, cfg, begin):
-    (eq, tr), _ = run_cfg(candles, cfg, begin)
+    log = []
+    eq, tr = equity_curve(candles, make_signal(candles, cfg[0]), begin, cfg[1], cfg[2], log)
     ts = [c[0] for c in candles[begin:]]
     yy, bh = yearly(ts, eq), yearly(ts, bh_curve(candles, begin))
     rets, dds, bears = coin_flips(candles, begin, tr)
@@ -282,6 +344,12 @@ def test_asset(sym, candles, cfg, begin):
         beat = pct_rank(sorted(b[y] for b in bears), yy[y])
         wins += beat >= 50
         print(f"  bear {y}: strategy {yy[y]:+.0f}% vs buy&hold {bh[y]:+.0f}%, beats {beat:.0f}% of coin flips")
+    f_eq, f_tr = equity_curve(candles, faber_signal(candles), begin)
+    print("\nCOMPARE (same dates, fees included)   return   max drawdown   orders")
+    for name, curve, n in (("frozen rule", eq, tr), ("Faber 10-month", f_eq, f_tr),
+                           ("buy & hold", bh_curve(candles, begin), 0)):
+        print(f"  {name:32}{(curve[-1] / START - 1) * 100:>+8.0f}%{max_dd(curve):>13.0f}%{n:>9}")
+    journal_report(sym, log)
     ok = pr >= 95
     print("VERDICT:", "PASS (>=95th percentile of coin flips)" if ok else "NOT proven better than a coin flip")
     return ok
@@ -320,13 +388,23 @@ def run_paper():
     print("Rule (chosen on pre-2020 BTC):", label(cfg))
     for s in ("BTC", "SOL"):
         c = fetch_history(s) if s != "BTC" else btc
-        w = make_signal(c, cfg[0])[-1]
-        print(f"{s} last close {c[-1][4]:.2f}: {'HOLD' if w else 'CASH'}")
+        want = make_signal(c, cfg[0])
+        last = c[-1][4]
+        log = []
+        # replay history to see whether the paper position is open
+        equity_curve(c, want, 200, cfg[1], cfg[2], log)
+        print(f"{s} last close {last:.2f}: signal {'HOLD' if want[-1] else 'CASH'}")
+        if log and "pnl" not in log[-1]:
+            t = log[-1]
+            print(f"  FLOATING: bought {day(t['in'])} at {t['buy']:.2f}, "
+                  f"now {(last / t['buy'] - 1) * 100:+.1f}% (before fees)")
+            if not want[-1]:
+                print("  Sell signal: would sell at the next open")
+        else:
+            print("  No open position, nothing floating")
     print("Paper only, no real trades.")
 
 
 if __name__ == "__main__":
     mode = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MODE", "backtest")).lower()
     run_paper() if mode == "paper" else run_backtest()
-
-
