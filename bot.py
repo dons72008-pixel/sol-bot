@@ -1,4 +1,4 @@
-"""Crypto bot v4.3: honest strategy test. No real money, no wallet, stdlib only.
+"""Crypto bot v4.9: honest strategy test. No real money, no wallet, stdlib only.
 
 Usage:  python bot.py backtest   (or env MODE=backtest)
         python bot.py paper
@@ -10,6 +10,18 @@ How it stays honest:
    SOL did not exist before 2020, so it is fully unseen.
 3. Signals use only past data and trades happen at the NEXT day's open.
 4. Result is compared with a matched coin flip (random long/cash, same number of trades).
+
+v4.9: candle table also shows the drop along the way (report only).
+
+v4.8: candle table uses all history, shown before and since 2020 (report only).
+
+v4.7: completes the hammer family (hanging man, inverted hammer), report only.
+
+v4.6: adds the "John Wick" candle (a huge wick), report only.
+
+v4.5: reads more candle shapes (report only; the candle filter is unchanged).
+
+v4.4: reads candle shapes, reports what happened after each, and compares a candle filter.
 
 v4.3: adds a "memory" version of the rule, shown side by side for comparison only.
 
@@ -225,6 +237,109 @@ def memory_signal(candles, want):
     return out, blocked
 
 
+# ---------- candle shapes ----------
+BEARISH = ("shooting star", "bearish engulfing")
+
+
+def candle_shapes(candles, i):
+    """Shapes visible at the close of day i (uses days up to i only)."""
+    _, o, h, l, c = candles[i]
+    rng, body = h - l, abs(c - o)
+    if rng <= 0 or i < 6:
+        return []
+    upper, lower = h - max(o, c), min(o, c) - l
+    fell, rose = candles[i - 1][4] < candles[i - 6][4], candles[i - 1][4] > candles[i - 6][4]
+    po, pc = candles[i - 1][1], candles[i - 1][4]
+    found = []
+    if body <= 0.1 * rng:
+        found.append("doji")
+    elif lower >= 2 * body and upper <= body and fell:
+        found.append("hammer")
+    elif upper >= 2 * body and lower <= body and rose:
+        found.append("shooting star")
+    if pc < po and c > o and o <= pc and c >= po and body > po - pc:
+        found.append("bullish engulfing")
+    if pc > po and c < o and o >= pc and c <= po and body > pc - po:
+        found.append("bearish engulfing")
+    # rest of the hammer family: same shapes, opposite prior move
+    if body > 0.1 * rng:
+        if lower >= 2 * body and upper <= body and rose:
+            found.append("hanging man")
+        if upper >= 2 * body and lower <= body and fell:
+            found.append("inverted hammer")
+    # v4.5 extra shapes. Crypto trades 24/7, so none of these require a price gap.
+    if body >= 0.9 * rng:
+        found.append("green marubozu" if c > o else "red marubozu")
+    if 0.1 * rng < body <= 0.3 * rng and upper > body and lower > body:
+        found.append("spinning top")
+    pbody, pmid = abs(pc - po), (po + pc) / 2
+    prng = candles[i - 1][2] - candles[i - 1][3]
+    long_prev = pbody >= 0.6 * prng and pbody > 0
+    if long_prev and body < pbody and max(o, c) <= max(po, pc) and min(o, c) >= min(po, pc):
+        if pc < po and c > o:
+            found.append("bullish harami")
+        elif pc > po and c < o:
+            found.append("bearish harami")
+    if long_prev and pc < po and c > o and o <= pc and pmid < c < po:
+        found.append("piercing line")
+    if long_prev and pc > po and c < o and o >= pc and po < c < pmid:
+        found.append("dark cloud cover")
+    _, ao, ah, al, ac = candles[i - 2]
+    abody = abs(ac - ao)
+    if abody >= 0.6 * (ah - al) and abody > 0 and pbody <= 0.3 * abody:
+        if ac < ao and c > o and c > (ao + ac) / 2:
+            found.append("morning star")
+        elif ac > ao and c < o and c < (ao + ac) / 2:
+            found.append("evening star")
+    three = candles[i - 2:i + 1]
+    strong = all(abs(x[4] - x[1]) >= 0.6 * (x[2] - x[3]) > 0 for x in three)
+    if strong and all(x[4] > x[1] for x in three) and ac < pc < c:
+        found.append("three white soldiers")
+    if strong and all(x[4] < x[1] for x in three) and ac > pc > c:
+        found.append("three black crows")
+    # John Wick: much bigger than usual, and one wick is most of the candle
+    if i >= 20:
+        usual = sum(x[2] - x[3] for x in candles[i - 20:i]) / 20
+        if rng >= 2 * usual and lower >= 0.66 * rng:
+            found.append("John Wick (low)")
+        if rng >= 2 * usual and upper >= 0.66 * rng:
+            found.append("John Wick (high)")
+    return found
+
+
+def candle_signal(candles, want):
+    """Do not START a position on a day with a bearish shape; check again next day."""
+    out, inside = [], False
+    for i, w in enumerate(want):
+        inside = w and (inside or not any(x in BEARISH for x in candle_shapes(candles, i)))
+        out.append(inside)
+    return out
+
+
+def shape_report(sym, candles, begin, end, period, days=5):
+    """Average price move over the next days after each shape, against all days."""
+    seen, every = {}, []
+    for i in range(begin, end - days):
+        move = (candles[i + days][4] / candles[i + 1][1] - 1) * 100
+        # lowest price during those days, measured from the buy price (0 = never below it)
+        dip = min(0.0, (min(x[3] for x in candles[i + 1:i + 1 + days]) / candles[i + 1][1] - 1) * 100)
+        every.append((move, dip))
+        for name in candle_shapes(candles, i):
+            seen.setdefault(name, []).append((move, dip))
+    if not every:
+        print(f"\n{sym} candle shapes {period}: no data")
+        return
+    print(f"\n{sym} candle shapes {period}: what happened by the {days}th day after (before fees)")
+    print("  dip = typical drop along the way; bad dip = 1 time in 10 it was this deep or deeper")
+    for name, both in [("ANY day", every)] + sorted(seen.items()):
+        m = [x for x, _ in both]
+        dips = sorted(d for _, d in both)  # most negative first
+        up = 100 * sum(1 for v in m if v > 0) / len(m)
+        few = "  (too few to judge)" if len(m) < 30 else ""
+        print(f"  {name:20} seen {len(m):5}  went up {up:3.0f}%  average {sum(m) / len(m):+.1f}%"
+              f"  dip {dips[len(dips) // 2]:+.1f}%  bad dip {dips[(len(dips) - 1) // 10]:+.1f}%{few}")
+
+
 # ---------- simulator ----------
 def equity_curve(candles, want, begin, stop=None, volsize=False, log=None):
     """Signal at close of bar i-1 -> trade at open of bar i."""
@@ -376,11 +491,16 @@ def test_asset(sym, candles, cfg, begin):
     print("\nCOMPARE (same dates, fees included)   return   max drawdown   orders")
     m_want, blocked = memory_signal(candles, make_signal(candles, cfg[0]))
     m_eq, m_tr = equity_curve(candles, m_want, begin, cfg[1], cfg[2])
+    k_eq, k_tr = equity_curve(candles, candle_signal(candles, make_signal(candles, cfg[0])), begin, cfg[1], cfg[2])
     for name, curve, n in (("frozen rule", eq, tr), ("rule + memory", m_eq, m_tr),
+                           ("rule + candles", k_eq, k_tr),
                            ("Faber 10-month", f_eq, f_tr),
                            ("buy & hold", bh_curve(candles, begin), 0)):
         print(f"  {name:32}{(curve[-1] / START - 1) * 100:>+8.0f}%{max_dd(curve):>13.0f}%{n:>9}")
     journal_report(sym, log)
+    cut = next((i for i, x in enumerate(candles) if x[0] >= CUT), len(candles))
+    shape_report(sym, candles, 6, cut, "BEFORE 2020")
+    shape_report(sym, candles, cut, len(candles), "SINCE 2020")
     recent = [b for b in blocked if b[0] >= begin]
     print(f"Memory blocked {len(recent)} buys in the test years. Last 5:")
     for i, now, n, avg in recent[-5:]:
@@ -430,6 +550,8 @@ def run_paper():
         equity_curve(c, want, 200, cfg[1], cfg[2], log)
         print(f"{s} last close {last:.2f}: signal {'HOLD' if want[-1] else 'CASH'}")
         print(f"  with memory: {'HOLD' if memory_signal(c, want)[0][-1] else 'CASH'}")
+        print(f"  with candles: {'HOLD' if candle_signal(c, want)[-1] else 'CASH'}")
+        print(f"  last candle: {', '.join(candle_shapes(c, len(c) - 1)) or 'no listed shape'}")
         if log and "pnl" not in log[-1]:
             t = log[-1]
             print(f"  FLOATING: bought {day(t['in'])} at {t['buy']:.2f}, "
